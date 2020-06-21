@@ -12,7 +12,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/fasthttp/websocket"
+	"github.com/gorilla/websocket"
 )
 
 var addr = flag.String("addr", "localhost:8080", "http service address")
@@ -58,7 +58,7 @@ var homeTemplate = template.Must(template.New("").Parse(`
 <html>
 <head>
 <meta charset="utf-8">
-<script>
+<script>  
 window.addEventListener("load", function(evt) {
 
     var output = document.getElementById("output");

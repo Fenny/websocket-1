@@ -9,12 +9,12 @@ import (
 	"flag"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"time"
 
-	"github.com/fasthttp/websocket"
-	"github.com/valyala/fasthttp"
+	"github.com/gorilla/websocket"
 )
 
 var (
@@ -98,80 +98,83 @@ func internalError(ws *websocket.Conn, msg string, err error) {
 	ws.WriteMessage(websocket.TextMessage, []byte("Internal server error."))
 }
 
-var upgrader = websocket.FastHTTPUpgrader{}
+var upgrader = websocket.Upgrader{}
 
-func serveWs(ctx *fasthttp.RequestCtx) {
-	err := upgrader.Upgrade(ctx, func(ws *websocket.Conn) {
-		defer ws.Close()
-
-		outr, outw, err := os.Pipe()
-		if err != nil {
-			internalError(ws, "stdout:", err)
-			return
-		}
-		defer outr.Close()
-		defer outw.Close()
-
-		inr, inw, err := os.Pipe()
-		if err != nil {
-			internalError(ws, "stdin:", err)
-			return
-		}
-		defer inr.Close()
-		defer inw.Close()
-
-		proc, err := os.StartProcess(cmdPath, flag.Args(), &os.ProcAttr{
-			Files: []*os.File{inr, outw, outw},
-		})
-		if err != nil {
-			internalError(ws, "start:", err)
-			return
-		}
-
-		inr.Close()
-		outw.Close()
-
-		stdoutDone := make(chan struct{})
-		go pumpStdout(ws, outr, stdoutDone)
-		go ping(ws, stdoutDone)
-
-		pumpStdin(ws, inw)
-
-		// Some commands will exit when stdin is closed.
-		inw.Close()
-
-		// Other commands need a bonk on the head.
-		if err := proc.Signal(os.Interrupt); err != nil {
-			log.Println("inter:", err)
-		}
-
-		select {
-		case <-stdoutDone:
-		case <-time.After(time.Second):
-			// A bigger bonk on the head.
-			if err := proc.Signal(os.Kill); err != nil {
-				log.Println("term:", err)
-			}
-			<-stdoutDone
-		}
-
-		if _, err := proc.Wait(); err != nil {
-			log.Println("wait:", err)
-		}
-	})
-
+func serveWs(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("upgrade:", err)
 		return
 	}
-}
 
-func serveHome(ctx *fasthttp.RequestCtx) {
-	if !ctx.IsGet() {
-		ctx.Error("Method not allowed", fasthttp.StatusMethodNotAllowed)
+	defer ws.Close()
+
+	outr, outw, err := os.Pipe()
+	if err != nil {
+		internalError(ws, "stdout:", err)
 		return
 	}
-	fasthttp.ServeFile(ctx, "../home.html")
+	defer outr.Close()
+	defer outw.Close()
+
+	inr, inw, err := os.Pipe()
+	if err != nil {
+		internalError(ws, "stdin:", err)
+		return
+	}
+	defer inr.Close()
+	defer inw.Close()
+
+	proc, err := os.StartProcess(cmdPath, flag.Args(), &os.ProcAttr{
+		Files: []*os.File{inr, outw, outw},
+	})
+	if err != nil {
+		internalError(ws, "start:", err)
+		return
+	}
+
+	inr.Close()
+	outw.Close()
+
+	stdoutDone := make(chan struct{})
+	go pumpStdout(ws, outr, stdoutDone)
+	go ping(ws, stdoutDone)
+
+	pumpStdin(ws, inw)
+
+	// Some commands will exit when stdin is closed.
+	inw.Close()
+
+	// Other commands need a bonk on the head.
+	if err := proc.Signal(os.Interrupt); err != nil {
+		log.Println("inter:", err)
+	}
+
+	select {
+	case <-stdoutDone:
+	case <-time.After(time.Second):
+		// A bigger bonk on the head.
+		if err := proc.Signal(os.Kill); err != nil {
+			log.Println("term:", err)
+		}
+		<-stdoutDone
+	}
+
+	if _, err := proc.Wait(); err != nil {
+		log.Println("wait:", err)
+	}
+}
+
+func serveHome(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	http.ServeFile(w, r, "home.html")
 }
 
 func main() {
@@ -184,21 +187,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	requestHandler := func(ctx *fasthttp.RequestCtx) {
-		switch string(ctx.Path()) {
-		case "/":
-			serveHome(ctx)
-		case "/ws":
-			serveWs(ctx)
-		default:
-			ctx.Error("Unsupported path", fasthttp.StatusNotFound)
-		}
-	}
-	server := fasthttp.Server{
-		Name:    "CommandExample",
-		Handler: requestHandler,
-	}
-
-	log.Fatal(server.ListenAndServe(*addr))
+	http.HandleFunc("/", serveHome)
+	http.HandleFunc("/ws", serveWs)
+	log.Fatal(http.ListenAndServe(*addr, nil))
 }

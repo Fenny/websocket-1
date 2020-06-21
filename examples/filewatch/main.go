@@ -9,12 +9,12 @@ import (
 	"html/template"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"time"
 
-	"github.com/fasthttp/websocket"
-	"github.com/valyala/fasthttp"
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -28,14 +28,14 @@ const (
 	pingPeriod = (pongWait * 9) / 10
 
 	// Poll file for changes with this period.
-	filePeriod = 1 * time.Second
+	filePeriod = 10 * time.Second
 )
 
 var (
 	addr      = flag.String("addr", ":8080", "http service address")
 	homeTempl = template.Must(template.New("").Parse(homeHTML))
 	filename  string
-	upgrader  = websocket.FastHTTPUpgrader{
+	upgrader  = websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 	}
@@ -110,33 +110,34 @@ func writer(ws *websocket.Conn, lastMod time.Time) {
 	}
 }
 
-func serveWs(ctx *fasthttp.RequestCtx) {
-	err := upgrader.Upgrade(ctx, func(ws *websocket.Conn) {
-		var lastMod time.Time
-		if n, err := strconv.ParseInt(string(ctx.FormValue("lastMod")), 16, 64); err == nil {
-			lastMod = time.Unix(0, n)
-		}
-
-		go writer(ws, lastMod)
-		reader(ws)
-	})
-
+func serveWs(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		if _, ok := err.(websocket.HandshakeError); ok {
+		if _, ok := err.(websocket.HandshakeError); !ok {
 			log.Println(err)
 		}
 		return
 	}
-}
 
-func serveHome(ctx *fasthttp.RequestCtx) {
-	if !ctx.IsGet() {
-		ctx.Error("Method not allowed", fasthttp.StatusMethodNotAllowed)
-		return
+	var lastMod time.Time
+	if n, err := strconv.ParseInt(r.FormValue("lastMod"), 16, 64); err == nil {
+		lastMod = time.Unix(0, n)
 	}
 
-	ctx.SetContentType("text/html; charset=utf-8")
+	go writer(ws, lastMod)
+	reader(ws)
+}
 
+func serveHome(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	p, lastMod, err := readFileIfModified(time.Time{})
 	if err != nil {
 		p = []byte(err.Error())
@@ -147,11 +148,11 @@ func serveHome(ctx *fasthttp.RequestCtx) {
 		Data    string
 		LastMod string
 	}{
-		string(ctx.Host()),
+		r.Host,
 		string(p),
 		strconv.FormatInt(lastMod.UnixNano(), 16),
 	}
-	homeTempl.Execute(ctx, &v)
+	homeTempl.Execute(w, &v)
 }
 
 func main() {
@@ -160,23 +161,11 @@ func main() {
 		log.Fatal("filename not specified")
 	}
 	filename = flag.Args()[0]
-
-	requestHandler := func(ctx *fasthttp.RequestCtx) {
-		switch string(ctx.Path()) {
-		case "/":
-			serveHome(ctx)
-		case "/ws":
-			serveWs(ctx)
-		default:
-			ctx.Error("Unsupported path", fasthttp.StatusNotFound)
-		}
+	http.HandleFunc("/", serveHome)
+	http.HandleFunc("/ws", serveWs)
+	if err := http.ListenAndServe(*addr, nil); err != nil {
+		log.Fatal(err)
 	}
-	server := fasthttp.Server{
-		Name:    "EchoExample",
-		Handler: requestHandler,
-	}
-
-	log.Fatal(server.ListenAndServe(*addr))
 }
 
 const homeHTML = `<!DOCTYPE html>
@@ -186,19 +175,19 @@ const homeHTML = `<!DOCTYPE html>
     </head>
     <body>
         <pre id="fileData">{{.Data}}</pre>
-	</body>
-	<script type="text/javascript">
-		(function() {
-			var data = document.getElementById("fileData");
-			var conn = new WebSocket("ws://{{.Host}}/ws?lastMod={{.LastMod}}");
-			conn.onclose = function(evt) {
-				data.textContent = 'Connection closed';
-			}
-			conn.onmessage = function(evt) {
-				console.log('file updated');
-				data.textContent = evt.data;
-			}
-		})();
-	</script>
+        <script type="text/javascript">
+            (function() {
+                var data = document.getElementById("fileData");
+                var conn = new WebSocket("ws://{{.Host}}/ws?lastMod={{.LastMod}}");
+                conn.onclose = function(evt) {
+                    data.textContent = 'Connection closed';
+                }
+                conn.onmessage = function(evt) {
+                    console.log('file updated');
+                    data.textContent = evt.data;
+                }
+            })();
+        </script>
+    </body>
 </html>
 `
